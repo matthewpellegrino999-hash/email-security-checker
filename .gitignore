@@ -1,0 +1,12 @@
+# Class materials (kept private)
+*.pptx
+Capstone Speech Script.docx
+Presentation_Script.docx
+
+# Office lock files and system files
+~$*
+.DS_Store
+__pycache__/
+
+# Presentation backup screenshots
+Screenshot*.png
