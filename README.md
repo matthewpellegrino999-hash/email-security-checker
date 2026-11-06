@@ -38,7 +38,7 @@ python3 email_checker.py yourorg.org
 ```
 
 Or open `email_checker.py` in IDLE and choose **Run → Run Module** (F5). It will ask
-for the domain to check and whether to save an HTML report.
+for a domain to check (or a saved `.eml` email) and whether to save an HTML report.
 
 Save a shareable HTML report:
 
@@ -50,6 +50,12 @@ If you know your DKIM selector (see "Finding your DKIM selector" below):
 
 ```bash
 python3 email_checker.py yourorg.org --selector myselector
+```
+
+Check a real email you received (see "Checking a real email" below):
+
+```bash
+python3 email_checker.py --email message.eml
 ```
 
 ---
@@ -175,9 +181,40 @@ The checker tries common selector names automatically. If yours isn't found:
 |---|---|
 | A | No failures or warnings |
 | B | No failures, 1–2 warnings |
-| C | 1 failure, or several warnings |
+| C | 1 failure, several warnings, or DMARC still set to `p=none` |
 | D | 2–3 failures |
 | F | 4+ failures |
+
+A DMARC policy of `p=none` limits the grade to **C**, because spoofed email is
+still delivered until the policy is changed to `quarantine` or `reject`. This is
+expected during the first weeks of the DMARC rollout (Step 3).
+
+---
+
+## Checking a real email
+
+Checking DNS shows the protections are **set up**. Checking a real email shows
+they actually **worked** on that message. When an email arrives, the receiving
+server (Gmail, Outlook, etc.) records its verdict in a hidden
+`Authentication-Results` header. The checker can read that header from a saved
+email and report:
+
+- **SPF:** did the sending server pass?
+- **DKIM:** did the message's signature pass?
+- **DMARC:** did SPF or DKIM pass for a domain that matches the visible
+  "From" address?
+
+**How to save an email with its original headers:**
+- **Gmail:** open the email → ⋮ (three dots) → **Download message**. This saves a `.eml` file.
+- **Outlook (desktop):** open the email → **File → Save As** → choose **.eml** if offered
+  (on Mac, drag the email to your desktop).
+
+Then run `python3 email_checker.py --email message.eml`, or run the script in
+IDLE and type the path to the `.eml` file when it asks.
+
+A forwarded email won't work, because forwarding removes the original headers.
+Only trust results added by your own email provider; a sender could add a fake
+header of their own.
 
 ---
 
@@ -188,16 +225,21 @@ The checker tries common selector names automatically. If yours isn't found:
   Linux.
 - SPF: checks for exactly one record, the strictness of the `all` mechanism,
   the 10-lookup limit, and deprecated `ptr` usage.
-- DKIM: tries about 20 common selectors from Google, Microsoft, Yahoo, and popular email
-  services, and detects revoked (empty) keys.
+- DKIM: tries about 20 common selectors from Google, Microsoft, Yahoo, DreamHost,
+  and popular email services, and detects revoked (empty) keys.
 - DMARC: checks the policy (`none` / `quarantine` / `reject`), `pct`, and
   whether reporting (`rua`) is configured.
 - Recognizes "parked" domains that correctly declare they send no email
   (`v=spf1 -all` and a null MX record).
 
+- Email check: reads the receiving server's `Authentication-Results` header
+  (falling back to `ARC-Authentication-Results`) and checks whether the SPF and
+  DKIM domains match the From address.
+
 **Limitations:** DKIM detection can't find custom selector names without
 `--selector`. SPF lookup counting only counts the top-level record, not nested
-includes.
+includes. The email check reports the receiving server's verdict; it doesn't
+re-verify signatures itself.
 
 ---
 

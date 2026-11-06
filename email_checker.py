@@ -2,17 +2,21 @@
 """
 Email Security Checker
 Checks a domain's SPF, DKIM, and DMARC records and explains how to fix problems.
+Can also read a saved email (.eml) and report whether it passed those checks.
 
 Usage:
     python3 email_checker.py example.org
     python3 email_checker.py example.org --selector myselector
     python3 email_checker.py example.org --html report.html
+    python3 email_checker.py --email message.eml
 
 Uses only the Python standard library. DNS lookups go through Cloudflare's
 public DNS-over-HTTPS service, so it works the same on Mac, Windows, and Linux.
 """
 
 import argparse
+import email
+import email.policy
 import html
 import json
 import os
@@ -22,6 +26,7 @@ import sys
 import urllib.parse
 import urllib.request
 from datetime import datetime
+from email.utils import parseaddr
 
 DOH_URL = "https://cloudflare-dns.com/dns-query"
 
@@ -35,12 +40,18 @@ if not SSL_CONTEXT.cert_store_stats()["x509_ca"] and os.path.exists("/etc/ssl/ce
 COMMON_DKIM_SELECTORS = [
     "google", "20230601", "20210112",  # Google Workspace
     "s2048", "s1024",                  # Yahoo / AOL
+    "dreamhost",                       # DreamHost
     "selector1", "selector2",    # Microsoft 365
     "default", "dkim", "mail", "k1", "k2", "s1", "s2",
     "smtp", "mandrill", "mxvault", "everlytickey1", "zoho",
 ]
 
 PASS, WARN, FAIL, INFO = "PASS", "WARN", "FAIL", "INFO"
+
+# DMARC p=none still delivers spoofed mail, so it limits the grade to C.
+DMARC_NONE_MSG = ("Policy is 'none': monitoring only, spoofed email is still delivered. "
+                  "Move to 'quarantine' after reviewing reports. (Grade is capped at C "
+                  "until this changes.)")
 
 
 # ---------------------------------------------------------------- DNS lookups
@@ -198,8 +209,7 @@ def check_dmarc(domain):
         results.append((PASS, "Policy is 'quarantine': spoofed email goes to spam. "
                               "Consider moving to 'reject' once reports look clean."))
     elif policy == "none":
-        results.append((WARN, "Policy is 'none': monitoring only, spoofed email is still "
-                              "delivered. Move to 'quarantine' after reviewing reports."))
+        results.append((WARN, DMARC_NONE_MSG))
     else:
         results.append((FAIL, "Missing or invalid 'p=' policy tag."))
 
@@ -262,12 +272,17 @@ def check_dkim(domain, extra_selectors=None, spf_record=None):
 # -------------------------------------------------------------------- output
 
 def grade(sections):
-    statuses = [s for _, items in sections for s, _ in items]
+    items = [item for _, section_items in sections for item in section_items]
+    statuses = [status for status, _ in items]
     fails, warns = statuses.count(FAIL), statuses.count(WARN)
+    dmarc_none = (WARN, DMARC_NONE_MSG) in items
     if fails == 0 and warns == 0:
         return "A", "Excellent. This domain is well protected against spoofing."
-    if fails == 0 and warns <= 2:
+    if fails == 0 and warns <= 2 and not dmarc_none:
         return "B", "Good, with a few improvements recommended."
+    if fails == 0 and dmarc_none:
+        return "C", ("Set up, but not enforced yet. Spoofed email is still delivered "
+                     "until DMARC is changed from 'none'.")
     if fails <= 1:
         return "C", "Partially protected. Review the warnings and failures below."
     if fails <= 3:
@@ -279,10 +294,9 @@ COLORS = {PASS: "\033[32m", WARN: "\033[33m", FAIL: "\033[31m", INFO: "\033[36m"
 RESET = "\033[0m"
 
 
-def print_report(domain, sections, use_color=True):
-    letter, summary = grade(sections)
-    print(f"\nEmail Security Report for {domain}")
-    print("=" * (26 + len(domain)))
+def print_sections(heading, sections, use_color=True):
+    print(f"\n{heading}")
+    print("=" * len(heading))
     for title, items in sections:
         print(f"\n{title}")
         print("-" * len(title))
@@ -291,6 +305,11 @@ def print_report(domain, sections, use_color=True):
             if use_color:
                 tag = f"{COLORS[status]}{tag}{RESET}"
             print(f"  {tag} {message}")
+
+
+def print_report(domain, sections, use_color=True):
+    letter, summary = grade(sections)
+    print_sections(f"Email Security Report for {domain}", sections, use_color)
     print(f"\nOverall grade: {letter}  {summary}\n")
 
 
@@ -328,6 +347,111 @@ def write_html(domain, sections, path):
         f.write(page)
 
 
+# ------------------------------------------------------- saved email (.eml)
+
+RESULT_STATUS = {"pass": PASS, "none": WARN, "neutral": WARN, "policy": WARN,
+                 "fail": FAIL, "softfail": FAIL, "permerror": FAIL, "temperror": WARN}
+
+
+def parse_auth_results(header):
+    """Split an Authentication-Results header into {method: [(result, details)]}."""
+    header = " ".join(str(header).split())  # unfold multi-line headers
+    authserv_id = header.split(";", 1)[0].strip()
+    if "=" in authserv_id:  # Microsoft 365 omits the server name
+        authserv_id = None
+    found = {}
+    for method, result, details in re.findall(
+            r"\b(spf|dkim|dmarc)\s*=\s*([a-z]+)([^;]*)", header, re.IGNORECASE):
+        found.setdefault(method.lower(), []).append((result.lower(), details.strip()))
+    return authserv_id, found
+
+
+def detail(details, key):
+    match = re.search(rf"{re.escape(key)}=([^\s;]+)", details, re.IGNORECASE)
+    return match.group(1).lstrip("@") if match else None
+
+
+def domains_align(a, b):
+    """Relaxed alignment: same domain, or one is a subdomain of the other."""
+    if not a or not b:
+        return False
+    a, b = a.lower().rstrip("."), b.lower().rstrip(".")
+    return a == b or a.endswith("." + b) or b.endswith("." + a)
+
+
+def check_email_file(path):
+    with open(path, "rb") as f:
+        msg = email.message_from_binary_file(f, policy=email.policy.default)
+
+    from_domain = parseaddr(str(msg.get("From", "")))[1].rpartition("@")[2].lower()
+    headers = msg.get_all("Authentication-Results") or []
+    source = "Authentication-Results"
+    if not headers:
+        headers = msg.get_all("ARC-Authentication-Results") or []
+        source = "ARC-Authentication-Results"
+
+    overview = [(INFO, f"Subject: {msg.get('Subject', '(none)')}"),
+                (INFO, f"From: {msg.get('From', '(none)')}")]
+    if not headers:
+        overview.append((FAIL, "No Authentication-Results header found. Save the message with "
+                               "its original headers (Gmail: ⋮ > Download message; Outlook: "
+                               "File > Save As) and try again."))
+        return [("Message", overview)], None
+
+    # The topmost header is added by the final receiving server (your provider).
+    authserv_id, found = parse_auth_results(headers[0])
+    recorder = authserv_id or "the receiving server"
+    overview.append((INFO, f"Results recorded by: {recorder} ({source}). Only trust "
+                           "results added by your own email provider."))
+    sections = [("Message", overview)]
+
+    spf_items = []
+    for result, details in found.get("spf", [])[:1]:
+        mailfrom = detail(details, "smtp.mailfrom")
+        mailfrom = mailfrom.rpartition("@")[2] if mailfrom else None
+        spf_items.append((RESULT_STATUS.get(result, WARN),
+                          f"SPF {result}" + (f" for {mailfrom}" if mailfrom else "") + "."))
+        if result == "pass" and mailfrom and not domains_align(mailfrom, from_domain):
+            spf_items.append((INFO, f"SPF domain {mailfrom} does not match the From domain "
+                                    f"{from_domain}, so SPF alone can't satisfy DMARC."))
+    sections.append(("SPF (did the sending server pass?)",
+                     spf_items or [(WARN, "No SPF result recorded.")]))
+
+    dkim_items = []
+    for result, details in found.get("dkim", []):
+        d = detail(details, "header.d") or detail(details, "header.i")
+        d = d.rpartition("@")[2] if d else None
+        aligned = " (matches the From domain)" if domains_align(d, from_domain) else ""
+        dkim_items.append((RESULT_STATUS.get(result, WARN),
+                           f"DKIM {result}" + (f" for {d}{aligned}" if d else "") + "."))
+    sections.append(("DKIM (did the signature pass?)",
+                     dkim_items or [(WARN, "No DKIM result recorded.")]))
+
+    dmarc_items = []
+    dmarc_result = None
+    for result, details in found.get("dmarc", [])[:1]:
+        dmarc_result = result
+        hfrom = detail(details, "header.from") or from_domain
+        if result == "pass":
+            dmarc_items.append((PASS, f"DMARC pass: SPF or DKIM passed for a domain aligned "
+                                      f"with the From address ({hfrom})."))
+        else:
+            dmarc_items.append((RESULT_STATUS.get(result, WARN),
+                                f"DMARC {result} for {hfrom}: neither SPF nor DKIM passed for "
+                                "a domain aligned with the From address."))
+    sections.append(("DMARC (aligned with the From address?)",
+                     dmarc_items or [(WARN, "No DMARC result recorded.")]))
+    return sections, dmarc_result
+
+
+def email_verdict(dmarc_result):
+    if dmarc_result == "pass":
+        return "This message passed email authentication."
+    if dmarc_result in ("fail", "permerror"):
+        return "This message FAILED DMARC. It may be spoofed."
+    return "Inconclusive. The receiving server did not record a clear DMARC result."
+
+
 # ---------------------------------------------------------------------- main
 
 def main():
@@ -338,16 +462,35 @@ def main():
                         help="extra DKIM selector to try (can be repeated)")
     parser.add_argument("--html", metavar="FILE", help="also save an HTML report")
     parser.add_argument("--no-color", action="store_true", help="disable colored output")
+    parser.add_argument("--email", metavar="FILE",
+                        help="check a saved email (.eml) instead of a domain")
     args = parser.parse_args()
+    use_color = not args.no_color and sys.stdout.isatty()
 
-    # No domain given (e.g. run from IDLE with F5): ask for one.
-    if not args.domain:
-        args.domain = input("Enter a domain to check (e.g. redcross.org): ")
-        if not args.domain.strip():
+    # Nothing given (e.g. run from IDLE with F5): ask for a domain or .eml file.
+    if not args.domain and not args.email:
+        answer = input("Enter a domain to check (e.g. redcross.org), "
+                       "or the path to a saved .eml email: ").strip().strip("'\"")
+        if not answer:
             print("No domain entered.")
             sys.exit(1)
-        if not args.html and input("Save an HTML report too? (y/n): ").strip().lower().startswith("y"):
-            args.html = os.path.join(os.path.dirname(os.path.abspath(__file__)), "report.html")
+        if answer.lower().endswith(".eml"):
+            args.email = answer.replace("\\ ", " ")
+        else:
+            args.domain = answer
+            if not args.html and input("Save an HTML report too? (y/n): ").strip().lower().startswith("y"):
+                args.html = os.path.join(os.path.dirname(os.path.abspath(__file__)), "report.html")
+
+    if args.email:
+        try:
+            sections, dmarc_result = check_email_file(os.path.expanduser(args.email))
+        except OSError as e:
+            print(f"Error: could not open {args.email} ({e}).")
+            sys.exit(1)
+        print_sections(f"Email Authentication Check: {os.path.basename(args.email)}",
+                       sections, use_color)
+        print(f"\nVerdict: {email_verdict(dmarc_result)}\n")
+        return
 
     domain = args.domain.strip().lower()
     for prefix in ("https://", "http://", "www."):
